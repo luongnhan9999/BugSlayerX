@@ -1,3 +1,4 @@
+# v0.2.16
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 from genlayer import *
 from dataclasses import dataclass
@@ -8,12 +9,14 @@ try:
 except Exception:
     pass
 
+
 def _addr_str(addr: Address) -> str:
     """Safely format an Address instance into a lowercase hex string."""
     try:
         return addr.as_hex.lower()
     except Exception:
         return str(addr).lower()
+
 
 def _get_sender() -> Address:
     """Safely resolve transaction sender across GenVM runtime environments."""
@@ -34,11 +37,13 @@ def _get_sender() -> Address:
         pass
     raise gl.UserError("Cannot resolve sender address.")
 
+
 def _safe_transfer(recipient: Address, amount: bigint) -> None:
     """Safely transfer native GEN tokens."""
     if amount <= bigint(0):
         return
     gl.get_contract_at(recipient).emit_transfer(value=u256(int(amount)))
+
 
 def _validate_url(raw_url: str) -> str:
     """Validate URL scheme and block private/SSRF IP addresses."""
@@ -51,37 +56,57 @@ def _validate_url(raw_url: str) -> str:
             raise gl.UserError("Local and private network URLs are prohibited.")
     return clean
 
+
 @allow_storage
 @dataclass
-class BugReport:
+class ExploitReport:
     report_id: str
     researcher: Address
-    vulnerability_title: str
-    description: str
-    poc_url: str                # GitHub commit or PoC verification link
-    bounty_requested: bigint
-    status: str                 # "PENDING", "VERIFIED", "REJECTED", "FAILED_EVIDENCE", "CANCELLED"
-    severity: str               # "CRITICAL", "HIGH", "MEDIUM", "LOW", "INVALID", "FAILED_EVIDENCE", "CANCELLED"
-    score: bigint               # 0 to 100 severity score
-    evaluation_report: str
+    target_contract_url: str     # Source code/commit of the vulnerable contract
+    reproduction_poc_url: str    # Independent test script/PoC reproducing the exploit
+    cwe_tag: str                 # Claimed CWE vulnerability taxonomy
+    vulnerability_title: str     # Title of the security report
+    invariant_description: str   # State invariant claimed to be violated
+    fingerprint: str             # Deterministic hash (target + root cause) to prevent front-running
+    triage_bond: bigint          # Anti-spam stake (refunded if valid, slashed if spam)
+    status: str                  # "PENDING", "VERIFIED", "SLASHED_SPAM", "FAILED_EVIDENCE", "CANCELLED"
+    is_invariant_broken: bool    # Consensus verdict on whether the invariant is breached
+    confirmed_cwe: str           # Consensus CWE taxonomy categorization
+    risk_tier: str               # "CRITICAL", "HIGH", "MEDIUM", "LOW", "SPAM", "FAILED_EVIDENCE"
+    impact_score: bigint         # 0 to 100 severity impact score
+    evaluation_summary: str      # Consolidated jury evaluation report
     created_at: bigint
     resolved_at: bigint
     payout: bigint
+    bond_refunded: bigint
+
 
 class Contract(gl.Contract):
     """
-    BugSlayerX: Autonomous Bug Bounty & Exploit Verifier Protocol on GenLayer
+    BugSlayerX: Differential Exploit & Invariant Verifier (DEPIV Protocol)
+    A decentralized security verification primitive on GenLayer featuring:
+    1. Dual-evidence cross-verification (Target Source Code vs PoC Reproduction Script)
+    2. Anti-spam staking & slashing game theory
+    3. On-chain vulnerability fingerprint registry against duplicate exploit front-running
+    4. Multi-pillar semantic consensus on Invariant Breach, CWE taxonomy, and Risk Tiers
     """
     owner: Address
     report_count: bigint
-    reports: TreeMap[str, BugReport]
+    min_triage_bond: bigint
+    treasury_balance: bigint
     verified_count: bigint
+    slashed_spam_count: bigint
     total_bounty_paid: bigint
+    reports: TreeMap[str, ExploitReport]
+    vulnerability_registry: TreeMap[str, str]
 
     def __init__(self):
         self.owner = _get_sender()
         self.report_count = bigint(0)
+        self.min_triage_bond = bigint(50)  # Minimum 50 GEN anti-spam bond
+        self.treasury_balance = bigint(0)
         self.verified_count = bigint(0)
+        self.slashed_spam_count = bigint(0)
         self.total_bounty_paid = bigint(0)
 
     def _get_current_timestamp(self) -> bigint:
@@ -115,105 +140,188 @@ class Contract(gl.Contract):
     def get_report_count(self) -> int:
         return int(self.report_count)
 
+    @gl.public.view
+    def get_min_triage_bond(self) -> str:
+        return str(self.min_triage_bond)
+
+    @gl.public.view
+    def get_registered_exploit(self, fingerprint: str) -> str:
+        """Query if a vulnerability fingerprint has already been recorded on-chain."""
+        clean_fp = fingerprint.strip().lower()
+        if clean_fp in self.vulnerability_registry:
+            return self.vulnerability_registry[clean_fp]
+        return ""
+
     @gl.public.write.payable
-    def submit_bug_report(self, vulnerability_title: str, description: str, poc_url: str) -> str:
+    def fund_bounty_pool(self) -> None:
+        """Allow protocol owners or sponsors to fund the bounty reward treasury."""
+        val = bigint(gl.message.value)
+        if val <= bigint(0):
+            raise gl.UserError("Must fund a positive amount of GEN.")
+        self.treasury_balance += val
+
+    @gl.public.write.payable
+    def submit_exploit_report(
+        self,
+        target_contract_url: str,
+        reproduction_poc_url: str,
+        cwe_tag: str,
+        vulnerability_title: str,
+        invariant_description: str,
+        fingerprint: str
+    ) -> str:
         """
-        White-hat hacker submits a bug report with PoC URL / GitHub commit and locks/requests bounty.
+        Submit a security vulnerability with dual evidence sources and anti-spam bond.
+        Prevents duplicate submissions via deterministic vulnerability fingerprinting.
         """
-        bounty = bigint(gl.message.value)
+        bond = bigint(gl.message.value)
+        if bond < self.min_triage_bond:
+            raise gl.UserError(f"Insufficient triage bond. Minimum required is {self.min_triage_bond} GEN.")
+
+        clean_target = _validate_url(target_contract_url)
+        clean_poc = _validate_url(reproduction_poc_url)
+        if clean_target.lower() == clean_poc.lower():
+            raise gl.UserError("Target source and reproduction PoC must be distinct URLs.")
+
         clean_title = vulnerability_title.strip()
-        clean_desc = description.strip()
-        clean_url = _validate_url(poc_url)
+        clean_inv = invariant_description.strip()
+        clean_cwe = cwe_tag.strip().upper()
+        clean_fp = fingerprint.strip().lower()
 
         if len(clean_title) < 5:
             raise gl.UserError("Vulnerability title is too short.")
-        if len(clean_desc) < 20:
-            raise gl.UserError("Description is too short.")
+        if len(clean_inv) < 20:
+            raise gl.UserError("Invariant description must be at least 20 characters.")
+        if len(clean_fp) < 8:
+            raise gl.UserError("Invalid vulnerability fingerprint.")
+
+        # Duplicate front-running prevention
+        if clean_fp in self.vulnerability_registry:
+            existing_id = self.vulnerability_registry[clean_fp]
+            raise gl.UserError(f"Duplicate exploit detected. Vulnerability fingerprint already verified in Report #{existing_id}.")
 
         self.report_count += bigint(1)
         rid = str(self.report_count)
         now_ts = self._get_current_timestamp()
 
-        self.reports[rid] = BugReport(
+        self.reports[rid] = ExploitReport(
             report_id=rid,
             researcher=_get_sender(),
+            target_contract_url=clean_target,
+            reproduction_poc_url=clean_poc,
+            cwe_tag=clean_cwe,
             vulnerability_title=clean_title,
-            description=clean_desc,
-            poc_url=clean_url,
-            bounty_requested=bounty,
+            invariant_description=clean_inv,
+            fingerprint=clean_fp,
+            triage_bond=bond,
             status="PENDING",
-            severity="PENDING",
-            score=bigint(0),
-            evaluation_report="Awaiting validator vulnerability verification consensus.",
+            is_invariant_broken=False,
+            confirmed_cwe="PENDING",
+            risk_tier="PENDING",
+            impact_score=bigint(0),
+            evaluation_summary="Awaiting multi-pillar differential consensus.",
             created_at=now_ts if now_ts > bigint(0) else self.report_count,
             resolved_at=bigint(0),
-            payout=bigint(0)
+            payout=bigint(0),
+            bond_refunded=bigint(0)
         )
         return rid
 
     @gl.public.write
-    def verify_vulnerability(self, report_id: str) -> None:
+    def verify_exploit(self, report_id: str) -> None:
         """
-        Validators scrape the PoC/GitHub commit URL on-chain and utilize GenLayer LLM jury consensus
-        to evaluate validity, severity, and exploit impact.
+        Cross-verify the target contract code against the reproduction PoC test on-chain.
+        Executes GenLayer LLM jury consensus across invariant breach, CWE, and risk severity.
         """
         if report_id not in self.reports:
-            raise gl.UserError("Bug report not found.")
+            raise gl.UserError("Report not found.")
 
         rep = self.reports[report_id]
         if rep.status != "PENDING":
-            raise gl.UserError("Bug report has already been verified.")
+            raise gl.UserError("Report has already been resolved.")
 
+        target_url = str(rep.target_contract_url)
+        poc_url = str(rep.reproduction_poc_url)
         title_local = str(rep.vulnerability_title)
-        desc_local = str(rep.description)
-        url_local = str(rep.poc_url)
+        inv_local = str(rep.invariant_description)
+        cwe_claimed = str(rep.cwe_tag)
 
         def leader_fn():
-            web_content = ""
+            # Source 1: Target Contract Source
+            target_code = ""
             try:
-                res = gl.nondet.web.render(url_local, mode="text")
-                if hasattr(res, "content"):
-                    web_content = res.content
-                elif isinstance(res, dict) and "body" in res:
-                    web_content = res["body"]
+                res1 = gl.nondet.web.render(target_url, mode="text")
+                if hasattr(res1, "content"):
+                    target_code = res1.content
+                elif isinstance(res1, dict) and "body" in res1:
+                    target_code = res1["body"]
                 else:
-                    web_content = str(res)
+                    target_code = str(res1)
             except Exception:
-                web_content = ""
+                target_code = ""
 
-            lower_web = web_content[:500].lower() if web_content else ""
-            if len(web_content.strip()) < 15 or "404 not found" in lower_web or "error" in lower_web:
+            # Source 2: Reproduction PoC Test
+            poc_code = ""
+            try:
+                res2 = gl.nondet.web.render(poc_url, mode="text")
+                if hasattr(res2, "content"):
+                    poc_code = res2.content
+                elif isinstance(res2, dict) and "body" in res2:
+                    poc_code = res2["body"]
+                else:
+                    poc_code = str(res2)
+            except Exception:
+                poc_code = ""
+
+            lower_target = target_code[:500].lower() if target_code else ""
+            lower_poc = poc_code[:500].lower() if poc_code else ""
+
+            # Check accessibility of both independent evidence sources
+            if len(target_code.strip()) < 15 or "404 not found" in lower_target or len(poc_code.strip()) < 15 or "404 not found" in lower_poc:
                 return {
-                    "score": 0,
-                    "severity": "FAILED_EVIDENCE",
-                    "evaluation_report": "PoC / GitHub commit reference source is offline or inaccessible."
+                    "is_invariant_broken": False,
+                    "confirmed_cwe": "FAILED_EVIDENCE",
+                    "risk_tier": "FAILED_EVIDENCE",
+                    "impact_score": 0,
+                    "evaluation_summary": "One or more evidence sources (Target Source or PoC) are inaccessible."
                 }
 
-            snippet = web_content[:4000]
+            snippet_target = target_code[:2500]
+            snippet_poc = poc_code[:2500]
 
-            prompt = f"""You are an expert Smart Contract Security Auditor and Bug Bounty Triager.
-Evaluate the validity and severity of the following vulnerability report by examining the scraped PoC / GitHub commit reference.
+            prompt = f"""You are the Lead Smart Contract Security Auditor on the GenLayer Adjudication Jury.
+Perform a differential cross-verification between the Target Contract Source and the Reproduction PoC Script.
 
-VULNERABILITY TITLE: {title_local}
-DESCRIPTION: {desc_local}
+REPORT TITLE: {title_local}
+CLAIMED INVARIANT BREACH: {inv_local}
+CLAIMED CWE TAXONOMY: {cwe_claimed}
 
-SCRAPED PoC / COMMIT REFERENCE EVIDENCE:
+=== EVIDENCE SOURCE 1: TARGET CONTRACT SOURCE CODE ===
 \"\"\"
-{snippet}
+{snippet_target}
 \"\"\"
 
-EVALUATION RULES:
-- Assign a score from 0 to 100 based on severity, exploitability, and impact (0 = invalid/false positive, 100 = critical zero-day exploit).
-- Determine severity level: "CRITICAL", "HIGH", "MEDIUM", "LOW", or "INVALID".
-- If evidence is unparsable or broken, return "FAILED_EVIDENCE".
-- Provide a concise professional triage report (max 250 characters).
+=== EVIDENCE SOURCE 2: REPRODUCTION PoC TEST SCRIPT ===
+\"\"\"
+{snippet_poc}
+\"\"\"
+
+DIFFERENTIAL ANALYSIS REQUIREMENTS:
+1. Examine if the PoC script genuinely executes against the target contract logic and successfully demonstrates an invariant violation.
+2. If the report is a false positive, spam, fabricated, or does NOT breach the invariant, set is_invariant_broken = false, risk_tier = "SPAM", and confirmed_cwe = "SPAM_INVALID".
+3. Otherwise, classify confirmed_cwe into: "REENTRANCY", "ACCESS_CONTROL", "ORACLE_MANIPULATION", "ARITHMETIC_OVERFLOW", or "LOGIC_INVARIANT_DRAIN".
+4. Determine risk_tier: "CRITICAL", "HIGH", "MEDIUM", "LOW", or "SPAM".
+5. Assign impact_score between 0 and 100 (0 for spam/invalid, 100 for fatal fund loss).
+6. Provide a concise technical justification (max 250 characters).
 
 OUTPUT FORMAT:
 Respond ONLY with a VALID JSON object (no markdown, no backticks):
 {{
-  "score": <integer 0-100>,
-  "severity": "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | "INVALID" | "FAILED_EVIDENCE",
-  "evaluation_report": "<concise professional triage summary>"
+  "is_invariant_broken": true | false,
+  "confirmed_cwe": "REENTRANCY" | "ACCESS_CONTROL" | "ORACLE_MANIPULATION" | "ARITHMETIC_OVERFLOW" | "LOGIC_INVARIANT_DRAIN" | "SPAM_INVALID",
+  "risk_tier": "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | "SPAM",
+  "impact_score": <integer 0-100>,
+  "evaluation_summary": "<concise technical verdict>"
 }}"""
 
             try:
@@ -234,47 +342,62 @@ Respond ONLY with a VALID JSON object (no markdown, no backticks):
                         cleaned = cleaned[:-3]
                     parsed = json.loads(cleaned.strip())
 
-                score = int(parsed.get("score", 0))
+                inv_broken = bool(parsed.get("is_invariant_broken", False))
+                cwe = str(parsed.get("confirmed_cwe", "SPAM_INVALID")).strip().upper()
+                valid_cwes = ("REENTRANCY", "ACCESS_CONTROL", "ORACLE_MANIPULATION", "ARITHMETIC_OVERFLOW", "LOGIC_INVARIANT_DRAIN", "SPAM_INVALID", "FAILED_EVIDENCE")
+                if cwe not in valid_cwes:
+                    cwe = "SPAM_INVALID"
+
+                tier = str(parsed.get("risk_tier", "SPAM")).strip().upper()
+                valid_tiers = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "SPAM", "FAILED_EVIDENCE")
+                if tier not in valid_tiers:
+                    tier = "SPAM"
+
+                score = int(parsed.get("impact_score", 0))
                 score = max(0, min(100, score))
-                severity = str(parsed.get("severity", "INVALID")).strip().upper()
-                valid_sev = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INVALID", "FAILED_EVIDENCE")
-                if severity not in valid_sev:
-                    severity = "INVALID"
-                report = str(parsed.get("evaluation_report", "Evaluated."))[:250]
+                summary = str(parsed.get("evaluation_summary", "Differential evaluated."))[:250]
 
                 return {
-                    "score": score,
-                    "severity": severity,
-                    "evaluation_report": report
+                    "is_invariant_broken": inv_broken,
+                    "confirmed_cwe": cwe,
+                    "risk_tier": tier,
+                    "impact_score": score,
+                    "evaluation_summary": summary
                 }
             except Exception as e:
                 return {
-                    "score": 0,
-                    "severity": "FAILED_EVIDENCE",
-                    "evaluation_report": f"Evaluation error: {str(e)[:100]}"
+                    "is_invariant_broken": False,
+                    "confirmed_cwe": "FAILED_EVIDENCE",
+                    "risk_tier": "FAILED_EVIDENCE",
+                    "impact_score": 0,
+                    "evaluation_summary": f"Audit execution error: {str(e)[:100]}"
                 }
 
         def validator_fn(leader_res) -> bool:
             if not isinstance(leader_res, gl.vm.Return):
                 return False
             leader = leader_res.calldata
-            if not isinstance(leader, dict) or "severity" not in leader:
-                return False
-
-            valid_sev = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INVALID", "FAILED_EVIDENCE")
-            l_sev = str(leader.get("severity", "")).strip().upper()
-            if l_sev not in valid_sev:
+            if not isinstance(leader, dict) or "risk_tier" not in leader:
                 return False
 
             mine = leader_fn()
-            m_sev = str(mine.get("severity", "")).strip().upper()
 
-            if l_sev != m_sev:
+            # 1. Semantic match on invariant violation
+            if mine.get("is_invariant_broken") != leader.get("is_invariant_broken"):
                 return False
 
-            if l_sev != "FAILED_EVIDENCE":
-                l_score = int(leader.get("score", 0))
-                m_score = int(mine.get("score", 0))
+            # 2. Semantic match on Risk Tier
+            if str(mine.get("risk_tier", "")).strip().upper() != str(leader.get("risk_tier", "")).strip().upper():
+                return False
+
+            # 3. Semantic match on CWE Classification
+            if str(mine.get("confirmed_cwe", "")).strip().upper() != str(leader.get("confirmed_cwe", "")).strip().upper():
+                return False
+
+            # 4. Impact score tolerance bound (delta <= 20 points)
+            if leader.get("risk_tier") != "FAILED_EVIDENCE":
+                l_score = int(leader.get("impact_score", 0))
+                m_score = int(mine.get("impact_score", 0))
                 if abs(l_score - m_score) > 20:
                     return False
 
@@ -287,60 +410,104 @@ Respond ONLY with a VALID JSON object (no markdown, no backticks):
             try:
                 final_res = json.loads(str(adjudication_res))
             except Exception:
-                final_res = {"score": 0, "severity": "FAILED_EVIDENCE", "evaluation_report": "Consensus parse failed."}
+                final_res = {
+                    "is_invariant_broken": False,
+                    "confirmed_cwe": "FAILED_EVIDENCE",
+                    "risk_tier": "FAILED_EVIDENCE",
+                    "impact_score": 0,
+                    "evaluation_summary": "Consensus parse error."
+                }
 
-        score = int(final_res.get("score", 0))
-        score_clamped = max(0, min(100, score))
-        severity = str(final_res.get("severity", "FAILED_EVIDENCE")).strip().upper()
-        report = str(final_res.get("evaluation_report", "Processed."))
+        is_broken = bool(final_res.get("is_invariant_broken", False))
+        cwe_final = str(final_res.get("confirmed_cwe", "FAILED_EVIDENCE")).strip().upper()
+        tier_final = str(final_res.get("risk_tier", "FAILED_EVIDENCE")).strip().upper()
+        score_final = max(0, min(100, int(final_res.get("impact_score", 0))))
+        summary_final = str(final_res.get("evaluation_summary", "Adjudicated."))
 
-        rep.score = bigint(score_clamped)
-        rep.severity = severity
-        rep.evaluation_report = report
-        rep.status = "VERIFIED" if severity not in ("INVALID", "FAILED_EVIDENCE") else ("REJECTED" if severity == "INVALID" else "FAILED_EVIDENCE")
+        rep.is_invariant_broken = is_broken
+        rep.confirmed_cwe = cwe_final
+        rep.risk_tier = tier_final
+        rep.impact_score = bigint(score_final)
+        rep.evaluation_summary = summary_final
+
         now_ts = self._get_current_timestamp()
         rep.resolved_at = now_ts if now_ts > bigint(0) else self.report_count
 
-        if rep.status == "VERIFIED":
-            self.verified_count += bigint(1)
-            payout = rep.bounty_requested
-            rep.payout = payout
-            self.total_bounty_paid += payout
-            self.reports[report_id] = rep
-            _safe_transfer(rep.researcher, payout)
-        elif rep.status == "REJECTED":
+        # Settlement Game Theory:
+        if tier_final == "FAILED_EVIDENCE":
+            # Inaccessible evidence: 100% refund of bond, no penalties
+            rep.status = "FAILED_EVIDENCE"
             rep.payout = bigint(0)
+            rep.bond_refunded = rep.triage_bond
             self.reports[report_id] = rep
+            _safe_transfer(rep.researcher, rep.triage_bond)
+
+        elif not is_broken or tier_final == "SPAM" or cwe_final == "SPAM_INVALID":
+            # Anti-spam game theory: slash bond into protocol treasury
+            rep.status = "SLASHED_SPAM"
+            rep.payout = bigint(0)
+            rep.bond_refunded = bigint(0)
+            self.treasury_balance += rep.triage_bond
+            self.slashed_spam_count += bigint(1)
+            self.reports[report_id] = rep
+
         else:
-            # FAILED_EVIDENCE: refund requested bounty back to researcher
-            rep.payout = rep.bounty_requested
+            # Verified valid exploit: refund bond + calculate reward payout
+            rep.status = "VERIFIED"
+            self.verified_count += bigint(1)
+            self.vulnerability_registry[rep.fingerprint] = report_id
+
+            # Base reward calculation scaled by impact score and tier
+            base_reward = rep.triage_bond * bigint(2)  # Base 2x multiplier
+            if tier_final == "CRITICAL":
+                bonus = bigint(score_final) * bigint(5)
+            elif tier_final == "HIGH":
+                bonus = bigint(score_final) * bigint(3)
+            elif tier_final == "MEDIUM":
+                bonus = bigint(score_final) * bigint(2)
+            else:
+                bonus = bigint(score_final)
+
+            total_reward = base_reward + bonus
+            # Disburse from treasury if available
+            available = self.treasury_balance
+            actual_payout = total_reward if total_reward <= available else available
+            if actual_payout > bigint(0):
+                self.treasury_balance -= actual_payout
+
+            rep.payout = actual_payout
+            rep.bond_refunded = rep.triage_bond
+            self.total_bounty_paid += actual_payout
             self.reports[report_id] = rep
-            _safe_transfer(rep.researcher, rep.bounty_requested)
+
+            # Transfer bond refund + earned bounty to researcher
+            disbursement = rep.triage_bond + actual_payout
+            _safe_transfer(rep.researcher, disbursement)
 
     @gl.public.write
-    def cancel_report(self, report_id: str) -> None:
-        """Allow researcher to cancel pending report and withdraw requested bounty deposit if any."""
+    def cancel_pending_report(self, report_id: str) -> None:
+        """Allow researcher to withdraw pending report and reclaim their staked triage bond."""
         if report_id not in self.reports:
-            raise gl.UserError("Bug report not found.")
+            raise gl.UserError("Report not found.")
 
         rep = self.reports[report_id]
         if rep.status != "PENDING":
             raise gl.UserError("Only pending reports can be cancelled.")
 
         if _addr_str(_get_sender()) != _addr_str(rep.researcher):
-            raise gl.UserError("Only researcher can cancel report.")
+            raise gl.UserError("Only the original researcher can cancel this report.")
 
         rep.status = "CANCELLED"
-        rep.severity = "CANCELLED"
-        rep.evaluation_report = "Cancelled by researcher."
-        refund = rep.bounty_requested
-        rep.payout = refund
+        rep.risk_tier = "CANCELLED"
+        rep.evaluation_summary = "Cancelled by researcher prior to verification."
+        refund = rep.triage_bond
+        rep.bond_refunded = refund
+        rep.payout = bigint(0)
         now_ts = self._get_current_timestamp()
         rep.resolved_at = now_ts if now_ts > bigint(0) else self.report_count
         self.reports[report_id] = rep
 
-        if refund > bigint(0):
-            _safe_transfer(rep.researcher, refund)
+        _safe_transfer(rep.researcher, refund)
 
     @gl.public.view
     def get_report(self, report_id: str) -> str:
@@ -350,17 +517,23 @@ Respond ONLY with a VALID JSON object (no markdown, no backticks):
         return json.dumps({
             "report_id": r.report_id,
             "researcher": _addr_str(r.researcher),
+            "target_contract_url": r.target_contract_url,
+            "reproduction_poc_url": r.reproduction_poc_url,
+            "cwe_tag": r.cwe_tag,
             "vulnerability_title": r.vulnerability_title,
-            "description": r.description,
-            "poc_url": r.poc_url,
-            "bounty_requested": str(r.bounty_requested),
+            "invariant_description": r.invariant_description,
+            "fingerprint": r.fingerprint,
+            "triage_bond": str(r.triage_bond),
             "status": r.status,
-            "severity": r.severity,
-            "score": int(r.score),
-            "evaluation_report": r.evaluation_report,
+            "is_invariant_broken": r.is_invariant_broken,
+            "confirmed_cwe": r.confirmed_cwe,
+            "risk_tier": r.risk_tier,
+            "impact_score": int(r.impact_score),
+            "evaluation_summary": r.evaluation_summary,
             "created_at": str(r.created_at),
             "resolved_at": str(r.resolved_at),
-            "payout": str(r.payout)
+            "payout": str(r.payout),
+            "bond_refunded": str(r.bond_refunded)
         })
 
     @gl.public.view
@@ -368,5 +541,7 @@ Respond ONLY with a VALID JSON object (no markdown, no backticks):
         return json.dumps({
             "total_reports": int(self.report_count),
             "verified_count": int(self.verified_count),
+            "slashed_spam_count": int(self.slashed_spam_count),
+            "treasury_balance": str(self.treasury_balance),
             "total_bounty_paid": str(self.total_bounty_paid)
         })

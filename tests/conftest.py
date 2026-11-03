@@ -45,7 +45,7 @@ def sim_installMocks(mocks: dict, vm=None):
 
         llm_mocks = mocks.get("llm_mocks", {})
         if isinstance(llm_mocks, dict):
-            if "severity" in llm_mocks:
+            if any(k in llm_mocks for k in ("risk_tier", "is_invariant_broken", "severity", "verdict")):
                 vm.mock_llm(".*", json.dumps(llm_mocks))
             else:
                 for prompt_pattern, resp in llm_mocks.items():
